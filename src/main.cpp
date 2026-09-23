@@ -4,7 +4,6 @@
 
 const float afstandMeter = 0.6f;
 const unsigned long debounceTijdMs = 30;
-const unsigned long telTimeoutMs = 1000;
 const unsigned long snelheidTimeoutMs = 10800;
 
 // Ik stuur het viercijferige display direct aan.
@@ -14,9 +13,6 @@ const bool displayIngeschakeld = true;
 const bool commonAnode = false;
 
 uint8_t voertuigAantal = 0;
-
-bool wachtOpTweedeAs = false;
-unsigned long eersteAsTijdMs = 0;
 
 bool wachtOpSensor2 = false;
 unsigned long snelheidStartUs = 0;
@@ -55,7 +51,102 @@ const uint8_t cijferPatronen[10] = {
 };
 
 
-// Ik zet een bit in een register hoog of laag.
+// Ik stel de seriële communicatie in op 9600 baud.
+void uartBegin() {
+    uint16_t baudWaarde = (F_CPU / (16UL * 9600UL)) - 1;
+
+    UBRR0H = static_cast<uint8_t>(baudWaarde >> 8);
+    UBRR0L = static_cast<uint8_t>(baudWaarde);
+
+    UCSR0B = (1 << TXEN0);
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
+}
+
+
+// Ik verstuur één teken via het UART-dataregister.
+void uartSchrijfTeken(char teken) {
+    while (!(UCSR0A & (1 << UDRE0))) {
+    }
+
+    UDR0 = teken;
+}
+
+
+// Ik verstuur tekst via de seriële verbinding.
+void uartSchrijfTekst(const char *tekst) {
+    while (*tekst != '\0') {
+        uartSchrijfTeken(*tekst);
+        tekst++;
+    }
+}
+
+
+// Ik verstuur een nieuwe regel.
+void uartNieuweRegel() {
+    uartSchrijfTeken('\r');
+    uartSchrijfTeken('\n');
+}
+
+
+// Ik verstuur een geheel getal als tekst.
+void uartSchrijfGetal(uint16_t getal) {
+    char buffer[6];
+    uint8_t lengte = 0;
+
+    do {
+        buffer[lengte] = '0' + (getal % 10);
+        getal /= 10;
+        lengte++;
+    } while (getal > 0);
+
+    while (lengte > 0) {
+        lengte--;
+        uartSchrijfTeken(buffer[lengte]);
+    }
+}
+
+
+// Ik verstuur de snelheid met één cijfer achter de komma.
+void uartSchrijfSnelheid(float snelheid) {
+    if (snelheid < 0.0f) {
+        snelheid = 0.0f;
+    }
+
+    uint32_t tienden =
+        static_cast<uint32_t>(snelheid * 10.0f + 0.5f);
+
+    uint32_t geheel = tienden / 10;
+    uint8_t decimaal = tienden % 10;
+
+    if (geheel > 65535UL) {
+        uartSchrijfTekst(">65535");
+        return;
+    }
+
+    uartSchrijfGetal(static_cast<uint16_t>(geheel));
+    uartSchrijfTeken(',');
+    uartSchrijfTeken('0' + decimaal);
+}
+
+
+// Ik toon het voertuigaantal in de Serial Monitor.
+void toonAantalSerieel() {
+    uartSchrijfTekst("Aantal voertuigen: ");
+    uartSchrijfGetal(voertuigAantal);
+    uartNieuweRegel();
+}
+
+
+// Ik toon de snelheid in de Serial Monitor.
+void toonSnelheidSerieel() {
+    uartSchrijfTekst("Snelheid: ");
+    uartSchrijfSnelheid(snelheidKmh);
+    uartSchrijfTekst(" km/uur");
+    uartNieuweRegel();
+}
+
+
+// Ik zet een registerbit hoog of laag.
 void schrijfBit(
     volatile uint8_t &poort,
     uint8_t bit,
@@ -69,16 +160,18 @@ void schrijfBit(
 }
 
 
-// Ik toon het voertuigaantal binair op de vier leds.
+// Ik toon het voertuigaantal binair op A0 t/m A3.
 void toonAantalBinair() {
     PORTC = (PORTC & 0b11110000) | (voertuigAantal & 0x0F);
 }
 
 
-// Ik verhoog de teller en begin na 15 opnieuw bij 0.
+// Ik tel precies één voertuig na een afgeronde meting.
 void telVoertuig() {
     voertuigAantal = (voertuigAantal + 1) % 16;
+
     toonAantalBinair();
+    toonAantalSerieel();
 }
 
 
@@ -151,7 +244,7 @@ void selecteerCijfer(uint8_t positie) {
 }
 
 
-// Ik laat het display leeg tijdens de snelheidsmeting.
+// Ik werk het display bij zolang er een snelheid beschikbaar is.
 void vernieuwDisplay() {
     if (!displayIngeschakeld) {
         return;
@@ -172,7 +265,6 @@ void vernieuwDisplay() {
 
     alleCijfersUit();
 
-    // Ik gebruik drie cijfers van mijn viercijferige display.
     if (actiefCijfer < 3) {
         uint8_t patroon =
             cijferPatronen[displayCijfers[actiefCijfer]];
@@ -194,8 +286,12 @@ void vernieuwDisplay() {
 }
 
 
-// Ik start de snelheidsmeting bij de eerste puls van sensor 1.
-void startSnelheidsmeting() {
+// Ik start een meting alleen als er nog geen meting loopt.
+void verwerkSensor1() {
+    if (wachtOpSensor2) {
+        return;
+    }
+
     snelheidStartUs = micros();
     snelheidStartMs = millis();
 
@@ -203,31 +299,13 @@ void startSnelheidsmeting() {
     snelheidBeschikbaar = false;
 
     alleCijfersUit();
+
+    uartSchrijfTekst("Meting gestart");
+    uartNieuweRegel();
 }
 
 
-// Ik verwerk een geldige puls van sensor 1.
-void verwerkSensor1() {
-    unsigned long nuMs = millis();
-
-    if (!wachtOpTweedeAs) {
-        eersteAsTijdMs = nuMs;
-        wachtOpTweedeAs = true;
-
-        startSnelheidsmeting();
-        return;
-    }
-
-    // Ik tel één voertuig als beide assen binnen één seconde passeren.
-    if (nuMs - eersteAsTijdMs < telTimeoutMs) {
-        telVoertuig();
-    }
-
-    wachtOpTweedeAs = false;
-}
-
-
-// Ik bereken de snelheid wanneer sensor 2 wordt geactiveerd.
+// Ik rond de meting af en tel daarna één voertuig.
 void verwerkSensor2() {
     if (!wachtOpSensor2) {
         return;
@@ -235,21 +313,25 @@ void verwerkSensor2() {
 
     unsigned long tijdVerschilUs = micros() - snelheidStartUs;
 
-    if (tijdVerschilUs > 0) {
-        float tijdSeconden = tijdVerschilUs / 1000000.0f;
-
-        snelheidKmh =
-            (afstandMeter / tijdSeconden) * 3.6f;
-
-        berekenDisplayCijfers();
-        snelheidBeschikbaar = true;
+    if (tijdVerschilUs == 0) {
+        return;
     }
 
+    float tijdSeconden = tijdVerschilUs / 1000000.0f;
+
+    snelheidKmh = (afstandMeter / tijdSeconden) * 3.6f;
+
+    berekenDisplayCijfers();
+
     wachtOpSensor2 = false;
+    snelheidBeschikbaar = true;
+
+    toonSnelheidSerieel();
+    telVoertuig();
 }
 
 
-// Ik lees beide sensoren rechtstreeks via het PIND-register.
+// Ik lees beide sensoren via het PIND-register.
 void leesSensoren() {
     unsigned long nuMs = millis();
 
@@ -290,28 +372,22 @@ void leesSensoren() {
 }
 
 
-// Ik annuleer metingen wanneer de volgende puls te laat komt.
+// Ik stop een meting als sensor 2 te lang uitblijft.
 void controleerTimeouts() {
-    unsigned long nuMs = millis();
-
-    if (
-        wachtOpTweedeAs &&
-        nuMs - eersteAsTijdMs >= telTimeoutMs
-    ) {
-        wachtOpTweedeAs = false;
-    }
-
     if (
         wachtOpSensor2 &&
-        nuMs - snelheidStartMs >= snelheidTimeoutMs
+        millis() - snelheidStartMs >= snelheidTimeoutMs
     ) {
         wachtOpSensor2 = false;
         snelheidBeschikbaar = false;
+
+        uartSchrijfTekst("Meting verlopen: sensor 2 niet gedetecteerd");
+        uartNieuweRegel();
     }
 }
 
 
-// Ik stel de ingangen en uitgangen in via de AVR-registers.
+// Ik stel de ingangen en uitgangen in via AVR-registers.
 void setup() {
     // Ik gebruik D2 en D3 als ingangen met interne pull-ups.
     DDRD &= ~((1 << PD2) | (1 << PD3));
@@ -321,7 +397,6 @@ void setup() {
     DDRC |= 0b00001111;
     PORTC &= 0b11110000;
 
-    // Ik stel de displayuitgangen in.
     if (displayIngeschakeld) {
         // D4 t/m D7: segmenten A t/m D.
         DDRD |= 0b11110000;
@@ -329,31 +404,36 @@ void setup() {
         // D8 t/m D11: segmenten E, F, G en DP.
         DDRB |= 0b00001111;
 
-        // D12 en D13: displayposities 1 en 2.
+        // D12, D13, A4 en A5: de vier displayposities.
         DDRB |= (1 << PB4) | (1 << PB5);
-
-        // A4 en A5: displayposities 3 en 4.
         DDRC |= (1 << PC4) | (1 << PC5);
 
         alleCijfersUit();
         schrijfSegmenten(0);
     }
 
-    // Na een reset begint de teller opnieuw bij 0.
+    uartBegin();
+
     voertuigAantal = 0;
     toonAantalBinair();
 
     snelheidBeschikbaar = false;
+    wachtOpSensor2 = false;
 
     sensor1VorigRuw = !(PIND & (1 << PD2));
     sensor2VorigRuw = !(PIND & (1 << PD3));
 
     sensor1Stabiel = sensor1VorigRuw;
     sensor2Stabiel = sensor2VorigRuw;
+
+    uartSchrijfTekst("Verkeersmonitor gestart");
+    uartNieuweRegel();
+
+    toonAantalSerieel();
 }
 
 
-// Ik blijf de sensoren, timeouts en het display bijwerken.
+// Ik blijf de sensoren, timeout en het display bijwerken.
 void loop() {
     leesSensoren();
     controleerTimeouts();
